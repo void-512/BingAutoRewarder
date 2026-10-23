@@ -1,13 +1,15 @@
 """Interactive browser authentication without exchanging OAuth tokens for cookies."""
 
-from getpass import getpass
 import re
+import select
 import sys
+import termios
 import time
 from urllib.parse import urlsplit
 
 from selenium.common.exceptions import WebDriverException
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 
 from .stats import scrape_points_balance
@@ -21,6 +23,105 @@ LOGIN_HOSTS = REWARDS_HOSTS | {
     "www.bing.com",
     "account.microsoft.com",
 }
+
+
+# Read text and controls together so a React transition cannot mix two steps.
+# Deliberately exclude input values from the snapshot and its fingerprint.
+LOGIN_PAGE_SCRIPT = """
+const visible = e => e.getClientRects().length > 0 &&
+    getComputedStyle(e).visibility !== 'hidden';
+const enabled = e => !e.disabled && e.getAttribute('aria-disabled') !== 'true';
+const scope = document.querySelector('#view, [role=main], main, form') || document.body;
+const label = e => e.getAttribute('aria-label') ||
+    (e.getAttribute('aria-labelledby') || '').split(/\\s+/)
+      .map(id => document.getElementById(id)?.textContent || '').join(' ').trim() ||
+    Array.from(e.labels || []).map(l => l.innerText).join(' ').trim() ||
+    e.placeholder || e.name || e.id || 'Value';
+const actions = [];
+for (const e of document.querySelectorAll(
+    'input:not([type=hidden]):not([type=submit]):not([type=button]):' +
+    'not([type=checkbox]):not([type=radio])')) {
+    if (visible(e) && enabled(e) && !e.readOnly)
+        actions.push({kind:'input', label:label(e), element:e, primary:scope.contains(e)});
+}
+for (const e of document.querySelectorAll(
+    'button, input[type=submit], input[type=button], a, [role=button]')) {
+    if (!visible(e) || !enabled(e)) continue;
+    const text = e.innerText || (e.tagName === 'INPUT' ? e.value : '') ||
+        e.getAttribute('aria-label');
+    if (text) actions.push({kind:'click', label:text.trim(), element:e,
+        primary:scope.contains(e) && !e.closest('footer')});
+}
+const busy = Array.from(scope.querySelectorAll(
+    '[aria-busy=true], [role=progressbar], progress')).some(visible);
+return {url:location.href, text:(document.body?.innerText || '').slice(0,6000),
+    actions:actions, ready:document.readyState !== 'loading' && !busy &&
+        actions.some(a => a.primary && a.element.id !== 'back-button')};
+"""
+
+
+def read_login_page(driver):
+    return driver.execute_script(LOGIN_PAGE_SCRIPT)
+
+
+def login_page_key(page):
+    return (
+        page["url"],
+        page["text"],
+        page["ready"],
+        tuple((a["kind"], a["label"], a["element"].id) for a in page["actions"]),
+    )
+
+
+def wait_for_login_page(driver, previous=None, timeout=10):
+    """Wait for a stable interactive step, with a fixed upper bound."""
+    deadline = time.monotonic() + timeout
+    key = None
+    stable_since = time.monotonic()
+    page = None
+    while True:
+        now = time.monotonic()
+        try:
+            page = read_login_page(driver)
+            current = login_page_key(page)
+            if current != key:
+                key, stable_since = current, now
+            if page["ready"] and key != previous and now - stable_since >= 0.6:
+                return page
+        except WebDriverException:
+            page = None
+            key, stable_since = None, now
+        if now >= deadline:
+            # Take a fresh snapshot if every earlier read failed.
+            return page if page is not None else read_login_page(driver)
+        time.sleep(0.2)
+
+
+def read_login_choice(driver, shown_key, emit=print):
+    """Watch the page while waiting for a terminal choice, on the main thread."""
+    sys.stdout.write("Select a number: ")
+    sys.stdout.flush()
+    while True:
+        readable, _, _ = select.select([sys.stdin], [], [], 1)
+        if readable:
+            return input("").strip()
+        try:
+            changed = session_ready(driver) or (
+                login_page_key(read_login_page(driver)) != shown_key
+            )
+        except WebDriverException:
+            changed = True  # Let the bounded page reader handle navigation races.
+        if changed:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            # A half-entered number belongs to the old menu. Never reuse it as
+            # a choice on a different screen (especially an approval screen).
+            try:
+                termios.tcflush(sys.stdin, termios.TCIFLUSH)
+            except (OSError, ValueError):
+                pass
+            emit("Sign-in page updated automatically; showing the current step.")
+            return None
 
 
 class AuthenticationRequired(RuntimeError):
@@ -78,17 +179,18 @@ def require_session(driver):
 
 
 def interactive_login(
-    manager, meta, visible=False, read=input, secret=getpass, emit=print
+    manager, meta, visible=False, read=input, value_read=input, emit=print
 ):
     """A numbered view of Microsoft's real browser form; never exchanges tokens for cookies."""
     if not sys.stdin.isatty():
         raise ValueError("Authentication requires an interactive terminal")
     driver = manager.setup_driver(headless=not visible)
     verified = False
+    next_page = None
     try:
         driver.get(REWARDS_URL)
         emit(
-            "Choose a numbered action. Input values are hidden and never logged.\n"
+            "Choose a numbered action. Typed values are visible in the terminal.\n"
             "Use the site's Authenticator/passwordless options when offered.\n"
             "For native dialogs, QR codes or CAPTCHA, use the optional --visible noVNC session."
         )
@@ -96,41 +198,27 @@ def interactive_login(
             if session_ready(driver):
                 verified = True
                 break
-            page = urlsplit(driver.current_url)
+            snapshot = next_page or wait_for_login_page(driver)
+            next_page = None
+            page = urlsplit(snapshot["url"])
             if page.scheme != "https" or page.hostname not in LOGIN_HOSTS:
                 raise AuthenticationRequired(
                     "Unexpected sign-in origin; inspect it with --visible"
                 )
             emit(
                 f"\nPage information: {page.scheme}://{page.netloc}{page.path}\n"
-                + driver.find_element(By.TAG_NAME, "body").text[:6000]
+                + snapshot["text"]
             )
             number = show_authenticator_number(driver, emit)
-            actions = []
-            for field in driver.find_elements(
-                By.CSS_SELECTOR,
-                "input:not([type=hidden]):not([type=submit]):not([type=button]):"
-                "not([type=checkbox]):not([type=radio])",
-            ):
-                if field.is_displayed() and field.is_enabled():
-                    label = (
-                        field.get_attribute("aria-label")
-                        or field.get_attribute("name")
-                        or "Value"
-                    )
-                    actions.append(("input", f"Input: {label}", field))
-            for button in driver.find_elements(
-                By.CSS_SELECTOR,
-                "button, input[type=submit], input[type=button], a, [role=button]",
-            ):
-                if button.is_displayed() and button.is_enabled():
-                    label = (
-                        button.text
-                        or button.get_attribute("value")
-                        or button.get_attribute("aria-label")
-                    )
-                    if label:
-                        actions.append(("click", f"Click: {label}", button))
+            shown_key = login_page_key(snapshot)
+            actions = [
+                (
+                    a["kind"],
+                    f"{'Input' if a['kind'] == 'input' else 'Click'}: {a['label']}",
+                    a["element"],
+                )
+                for a in snapshot["actions"]
+            ]
             actions.extend(
                 (kind, label, None)
                 for kind, label in (
@@ -138,13 +226,22 @@ def interactive_login(
                     ("rewards", "Navigation: open Rewards"),
                     ("refresh", "Refresh this page"),
                     ("check", "Check authentication status"),
-                    ("wait", "Wait for approval on another device (up to 30 seconds)"),
+                    (
+                        "wait",
+                        "Wait for page update or device approval (up to 30 seconds)",
+                    ),
                     ("cancel", "Cancel and retain the existing profile"),
                 )
             )
             for index, (_, label, _) in enumerate(actions, 1):
                 emit(f"{index}. {label}")
-            choice = read("Select a number: ").strip()
+            choice = (
+                read_login_choice(driver, shown_key, emit)
+                if read is input
+                else read("Select a number: ").strip()
+            )
+            if choice is None:
+                continue
             if not choice.isdigit() or not 1 <= int(choice) <= len(actions):
                 emit("Enter one of the listed numbers.")
                 continue
@@ -154,11 +251,32 @@ def interactive_login(
                     "Authentication cancelled; profile retained"
                 )
             try:
+                latest = read_login_page(driver)
+                if login_page_key(latest) != shown_key:
+                    emit(
+                        "The sign-in page changed while waiting. Choose from the updated menu."
+                    )
+                    next_page = wait_for_login_page(driver)
+                    continue
                 if kind == "input":
-                    value = secret("Value (hidden): ")
-                    element.clear()
-                    element.send_keys(value)
-                    del value
+                    value = value_read("Value: ")
+                    try:
+                        if not value:
+                            emit(
+                                "No value entered; the existing field was left unchanged."
+                            )
+                            continue
+                        element.clear()
+                        element.send_keys(value)
+                        if element.get_property("value") != value:
+                            emit(
+                                "The field did not retain the entered value. Enter it again."
+                            )
+                        else:
+                            element.send_keys(Keys.TAB)
+                            emit("Value entered.")
+                    finally:
+                        del value
                 elif kind == "click":
                     element.click()
                 elif kind == "back":
@@ -180,8 +298,24 @@ def interactive_login(
                     deadline = time.monotonic() + 30
                     while time.monotonic() < deadline and not session_ready(driver):
                         number = show_authenticator_number(driver, emit, number)
-                        time.sleep(2)
-                time.sleep(0.5)
+                        current = read_login_page(driver)
+                        if current["ready"] and login_page_key(current) != shown_key:
+                            break
+                        time.sleep(0.5)
+                previous = (
+                    shown_key
+                    if kind in ("click", "back", "rewards", "refresh")
+                    else None
+                )
+                next_page = wait_for_login_page(driver, previous=previous)
+                if not next_page["ready"]:
+                    emit(
+                        "The sign-in page is still loading. Wait for a page update; refreshing resets the form."
+                    )
+                elif previous is not None and login_page_key(next_page) == previous:
+                    emit(
+                        "The page has not advanced. Review any validation message before retrying."
+                    )
             except WebDriverException:
                 emit(
                     "The page changed or that action is unavailable. Choose from the updated menu."

@@ -100,7 +100,9 @@ reuses it. Finish any active session before stopping it explicitly.
 
 Login presents page information followed by numbered **Input**, **Click** and
 navigation options. Enter only a number; input values are requested automatically
-and hidden. Numbered options also refresh the page, check authentication, wait for
+and visible as you type. The menu updates automatically when the sign-in page
+changes, including after Authenticator approval. Numbered options also refresh
+the page, check authentication, wait for
 remote MFA approval, navigate back/open Rewards, or cancel. Invalid numbers simply
 show the menu again.
 
