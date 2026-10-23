@@ -6,6 +6,7 @@ services:
     platform: linux/arm64
     restart: "no"
     shm_size: 1gb
+    cpu_shares: 256
     stop_grace_period: 2m
     ports:
       - "127.0.0.1:${AUTOREWARDER_WEBDRIVER_PORT:-4444}:4444"
