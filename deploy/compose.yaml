@@ -2,13 +2,10 @@ name: ${COMPOSE_PROJECT_NAME:-autorewarder-browser}
 services:
   chromium:
     # The pinned linux/arm64 manifest was verified through Docker Hub metadata.
-    image: ${SELENIUM_IMAGE:-selenium/standalone-chromium:4.51.0-20261010@sha256:42ce9ea56fa20549d629fc5ecc65c0bc6e5b1fd2b342e5a0a6d2bab8cee1d440}
+    image: ${SELENIUM_IMAGE:-selenium/standalone-chromium:latest}
     platform: linux/arm64
     restart: "no"
     shm_size: 1gb
-    mem_limit: 3g
-    cpus: 2.0
-    pids_limit: 512
     stop_grace_period: 2m
     ports:
       - "127.0.0.1:${AUTOREWARDER_WEBDRIVER_PORT:-4444}:4444"
