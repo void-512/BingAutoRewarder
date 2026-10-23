@@ -1,6 +1,7 @@
 """Interactive browser authentication without exchanging OAuth tokens for cookies."""
 
 from getpass import getpass
+import re
 import sys
 import time
 from urllib.parse import urlsplit
@@ -24,6 +25,31 @@ LOGIN_HOSTS = REWARDS_HOSTS | {
 
 class AuthenticationRequired(RuntimeError):
     """The stored browser profile no longer opens an authenticated dashboard."""
+
+
+def authenticator_number(driver):
+    """Read only Microsoft's number-matching challenge, never other hidden fields."""
+    for selector, attribute, require_visible in (
+        ("#psRNGCEntropy", "value", False),
+        ("#idRichContext_DisplaySign", "textContent", True),
+    ):
+        for element in driver.find_elements(By.CSS_SELECTOR, selector):
+            if require_visible and not element.is_displayed():
+                continue
+            value = (element.get_attribute(attribute) or "").strip()
+            if re.fullmatch(r"[0-9]{1,3}", value):
+                return value
+    return None
+
+
+def show_authenticator_number(driver, emit, previous=None):
+    number = authenticator_number(driver)
+    if number is not None and number != previous:
+        emit(
+            f"Microsoft Authenticator number: {number}\n"
+            "Enter this number in Microsoft Authenticator on your device."
+        )
+    return number
 
 
 def session_ready(driver):
@@ -79,6 +105,7 @@ def interactive_login(
                 f"\nPage information: {page.scheme}://{page.netloc}{page.path}\n"
                 + driver.find_element(By.TAG_NAME, "body").text[:6000]
             )
+            number = show_authenticator_number(driver, emit)
             actions = []
             for field in driver.find_elements(
                 By.CSS_SELECTOR,
@@ -152,6 +179,7 @@ def interactive_login(
                 elif kind == "wait":
                     deadline = time.monotonic() + 30
                     while time.monotonic() < deadline and not session_ready(driver):
+                        number = show_authenticator_number(driver, emit, number)
                         time.sleep(2)
                 time.sleep(0.5)
             except WebDriverException:
