@@ -4,6 +4,7 @@ import hashlib
 import os
 
 from selenium import webdriver
+from selenium.common.exceptions import InvalidSessionIdException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.remote.client_config import ClientConfig
 from selenium.webdriver.remote.file_detector import LocalFileDetector
@@ -21,7 +22,12 @@ class RemoteDriver(webdriver.Remote):
     profile_lock = None
 
     def quit(self):
-        super().quit()
+        try:
+            super().quit()
+        except InvalidSessionIdException:
+            # The remote browser is already gone; release the profile lease so
+            # recovery can create a fresh session using that same profile.
+            pass
         if self.profile_lock is not None:
             self.profile_lock.release()
             self.profile_lock = None

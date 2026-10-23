@@ -361,9 +361,10 @@ class StatsManager:
         earn_cards=0,
         quest_tasks=0,
         balance=None,
+        search_summary=None,
     ):
         """
-        Record one completed run: bump lifetime counters, refresh the
+        Record one attempted run: bump successful activity counters, refresh the
         last-session snapshot, fold in a freshly-scraped balance (if any), and
         add this run's activity to today's per-day aggregate.
 
@@ -374,6 +375,7 @@ class StatsManager:
             earn_cards (int): /earn point-earning cards opened this run.
             quest_tasks (int): quest punchcard tasks opened this run.
             balance (int | None): scraped real balance, or None if unavailable.
+            search_summary (dict | None): phase attempts, failures and completion.
 
         Returns:
             dict: the updated stats structure (also persisted to disk).
@@ -393,6 +395,7 @@ class StatsManager:
             and earn == 0
             and quests == 0
             and (balance is None)
+            and not search_summary
         ):
             return self.get_stats()
 
@@ -435,6 +438,8 @@ class StatsManager:
             "points_estimate": session_estimate,
             "points_delta": points_delta,
         }
+        if search_summary is not None:
+            stats["last_session"]["search_summary"] = search_summary
 
         # Fold this run into today's per-day aggregate. Pre-existing day
         # buckets from older stats.json files lack the earn/quests keys, so

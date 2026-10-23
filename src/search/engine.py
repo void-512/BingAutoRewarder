@@ -1,15 +1,24 @@
 """Search automation helpers for Bing queries."""
 
 import base64
+from dataclasses import dataclass
 import json
 import os
 import random
+import re
 import time
 from urllib.parse import urlencode, urlparse
 from selenium.webdriver.common.keys import Keys
-from selenium.common.exceptions import NoSuchElementException, WebDriverException
+from selenium.common.exceptions import (
+    InvalidSessionIdException,
+    NoSuchElementException,
+    TimeoutException,
+    WebDriverException,
+)
 from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
 
+from ..auth import AuthenticationRequired
 from ..utils import human_typing
 from ..emulator import HumanBehavior
 
@@ -123,6 +132,52 @@ VISUAL_SEARCH_INPUT_LOCATORS = (
 VISUAL_SEARCH_RESULT_URL_MARKERS = ("form=sbi", "iss=sbi", "bcid=", "view=detailv2")
 
 
+def webdriver_error_details(error):
+    """Keep the driver message and Chromium code, without native stack frames."""
+    message = getattr(error, "msg", None) or str(error)
+    message = re.split(r"(?im)^\s*Stacktrace:", message)[0]
+    codes = sorted(set(re.findall(r"net::ERR_[A-Z0-9_]+", message)))
+    detail = " ".join(message.split())[:2000]
+    return f"{type(error).__name__}: {detail or 'no driver message'}" + (
+        f" [{', '.join(codes)}]" if any(code not in detail for code in codes) else ""
+    )
+
+
+class SearchRestricted(AuthenticationRequired):
+    """A challenge or service restriction needs user attention, not retries."""
+
+
+@dataclass
+class SearchResult:
+    requested: int
+    attempted: int = 0
+    successful: int = 0
+    failed: int = 0
+    retries: int = 0
+    restarts: int = 0
+    restriction: str = ""
+
+
+# Retry transport failures, never certificate, policy or HTTP access failures.
+RETRYABLE_NETWORK_ERRORS = {
+    "ERR_CONNECTION_RESET",
+    "ERR_CONNECTION_CLOSED",
+    "ERR_CONNECTION_ABORTED",
+    "ERR_CONNECTION_FAILED",
+    "ERR_CONNECTION_REFUSED",
+    "ERR_CONNECTION_TIMED_OUT",
+    "ERR_TIMED_OUT",
+    "ERR_NETWORK_CHANGED",
+    "ERR_NAME_NOT_RESOLVED",
+    "ERR_INTERNET_DISCONNECTED",
+    "ERR_HTTP2_PROTOCOL_ERROR",
+    "ERR_HTTP2_PING_FAILED",
+    "ERR_QUIC_PROTOCOL_ERROR",
+    "ERR_EMPTY_RESPONSE",
+    "ERR_SOCKET_NOT_CONNECTED",
+}
+
+
 class SearchEngine:
     """
     A class to handle search operations with human-like behavior.
@@ -142,6 +197,7 @@ class SearchEngine:
         # Surface the last successful search ran on, so the caller can ask for
         # the other one when Rewards doesn't credit that one.
         self.last_search_url = None
+        self._navigation_state = {}
 
     def _log(self, message):
         """
@@ -219,202 +275,280 @@ class SearchEngine:
         mobile=False,
         stop_event=None,
         search_delay_range=(4.0, 10.0),
+        recreate_driver=None,
     ):
+        """Two recovery attempts per batch, at most one with a fresh session.
+
+        Attempted/failed count distinct queries. Retries count extra browser
+        attempts, including a retry that later succeeds. Unvisited queries are
+        skipped, not failed. Successful navigation does not prove Rewards credit.
         """
-        Perform searches on Bing using Selenium WebDriver with human-like behavior.
-
-        Args:
-            driver (WebDriver): An instance of Selenium WebDriver to control the browser.
-            queries (list): A list of search queries to perform.
-            mobile (bool): When True, HumanBehavior emits touch gestures instead
-                of mouse events — pair with a mobile-emulated driver.
-            stop_event (threading.Event, optional): If provided and set, the
-                loop bails out at the next checkpoint and any in-progress
-                coffee break is interrupted immediately.
-            search_delay_range (tuple): A tuple specifying the range of delays (min, max)
-                to use for each search.
-
-        Returns:
-            int: the number of searches that completed successfully (used by
-                the stats layer to record activity for this run).
-        """
-
-        human = HumanBehavior(driver, show_cursor=True, mobile=mobile)
-
-        delay_min, delay_max = search_delay_range
-
-        next_coffee_break = self.get_coffee_break_count()
-        searches_since_break = 0
-        successful = 0
-
-        self._log(f"Loaded {len(queries)} queries. Starting searches...")
-        self._log(f"Next coffee break after {next_coffee_break} searches.")
-
-        for i, query in enumerate(queries):
-            if stop_event is not None and stop_event.is_set():
-                self._log("Stop requested — halting search loop.")
-                return successful
-
-            try:
-                # Open Bing homepage
-                driver.get("https://www.bing.com")
-                # Random delay to mimic human behavior
-                time.sleep(random.uniform(delay_min, delay_max))
-
-                searches_since_break += 1
-
-                # Longer break every few searches to mimic human behavior
-                if searches_since_break >= next_coffee_break:
-
-                    if next_coffee_break > 9:
-                        pause_duration = random.uniform(45, 90)
-                        self._log("Taking a big coffee break...")
-                    else:
-                        pause_duration = random.uniform(15, 30)
-                        self._log("Taking a quick coffee break...")
-
-                    self._log(
-                        f"Sleeping for {pause_duration:.2f} seconds to mimic a coffee break."
-                    )
-                    # Interruptible sleep: Event.wait returns True early if Stop is pressed.
-                    if stop_event is not None:
-                        if stop_event.wait(pause_duration):
-                            self._log("Stop requested during coffee break — halting.")
-                            return successful
-                    else:
-                        time.sleep(pause_duration)
-
-                    next_coffee_break = self.get_coffee_break_count()
-                    searches_since_break = 0
-                    self._log(f"Next coffee break after {next_coffee_break} searches.")
-
-                # Find the search box, clear it
-                search_box = driver.find_element(By.NAME, "q")
-                search_box.clear()
-
-                # Log the search query in log area
-                self._log(f"Search #{i + 1}: {query}")
-
-                # Type the query with human-like delays
-                human_typing(search_box, query)
-                search_box.send_keys(Keys.RETURN)  # Press Enter to search
-
-                # Wait for result to load
-                time.sleep(random.uniform(2, 4))
-
-                tabs_config = [
-                    {"name": "All", "priority": 70, "id": None},
-                    {"name": "Images", "priority": 10, "id": "b-scopeListItem-images"},
-                    {"name": "Videos", "priority": 10, "id": "b-scopeListItem-video"},
-                    {"name": "News", "priority": 10, "id": "b-scopeListItem-news"},
-                ]
-
-                weights = [tab["priority"] for tab in tabs_config]
-                chosen_tab = random.choices(tabs_config, weights=weights, k=1)[0]
-
-                if chosen_tab["name"] != "All":
-                    main_tab = driver.current_window_handle
-                    tab_element = None
-
-                    # Check if news tab exists, if it doesn't choose Images or Videos
-                    if chosen_tab["name"] == "News":
-                        try:
-                            xpath = f"//nav/ul/li[@id='{chosen_tab['id']}']/a"
-                            tab_element = driver.find_element(By.XPATH, xpath)
-                        except NoSuchElementException:
-                            chosen_tab = random.choice(tabs_config[1:3])
-
-                    self._log(f"Chosen behavior: Switch to {chosen_tab['name']}")
-                    try:
-                        # Find the tab element using its id
-                        if not tab_element:
-                            xpath = f"//nav/ul/li[@id='{chosen_tab['id']}']/a"
-                            tab_element = driver.find_element(By.XPATH, xpath)
-
-                        # Move mouse and click the tab
-                        human.click_element(tab_element)
-
-                        time.sleep(random.uniform(3, 6))
-
-                    except NoSuchElementException:
-                        self._log(
-                            f"[WARNING] Tab {chosen_tab['name']} not found. Staying on 'All'."
-                        )
-
-                        # Fallback to "All" if the chosen tab is not found
-                        chosen_tab["name"] = "All"
-
-                    except WebDriverException as e:
-                        short_error = str(e).split("\n")[0][:28]
-                        self._log(
-                            f"[WARNING] WebDriver error when switching to {chosen_tab['name']}: {short_error}."
-                        )
-                        self._log("Staying on 'All'.")
-
-                        chosen_tab["name"] = "All"
-
-                # Scroll the page to mimic human behavior
+        result = SearchResult(requested=len(queries))
+        next_break = self.get_coffee_break_count()
+        since_break = 0
+        abort = False
+        for index, query in enumerate(queries, 1):
+            if self._stopped(stop_event):
+                break
+            if since_break >= next_break:
+                pause = (
+                    random.uniform(45, 90) if next_break > 9 else random.uniform(15, 30)
+                )
+                self._log(f"Taking a coffee break for {pause:.1f}s")
+                if self._search_pause(pause, stop_event):
+                    break
+                since_break = 0
+                next_break = self.get_coffee_break_count()
+            result.attempted += 1
+            since_break += 1
+            while True:
+                if self._stopped(stop_event):
+                    result.failed += 1
+                    abort = True
+                    break
                 try:
-                    if chosen_tab["name"] == "All":
-                        human.scroll_page()
-                except WebDriverException as e:
-                    short_error = str(e).split("\n")[0][:28]
+                    self._search_stage = "starting search"
+                    self._search_once(driver, query, index, mobile, search_delay_range)
+                except SearchRestricted as error:
+                    result.restriction = str(error)
+                    self._log(f"[RESTRICTED] {error}; no retry or session recreation")
+                    self._add_to_history(query, f"[RESTRICTED] {error}")
+                    result.failed += 1
+                    abort = True
+                    break
+                except WebDriverException as error:
+                    details = webdriver_error_details(error)
+                    # A navigation exception can still leave a readable HTTP
+                    # error/challenge page. Inspect it before any recovery.
+                    restriction = ""
+                    try:
+                        self._check_search_page(driver)
+                    except SearchRestricted as page_error:
+                        restriction = str(page_error)
+                    except WebDriverException:
+                        pass
                     self._log(
-                        f"[WARNING] WebDriver error when scrolling: {short_error}. Continuing."
+                        f"[ERROR] {'Mobile' if mobile else 'PC'} search #{index} "
+                        f"during {self._search_stage}: {details}; "
+                        f"page={json.dumps(self._navigation_state, sort_keys=True)}"
                     )
-
-                # Pause after scrolling
-                time.sleep(random.uniform(2, 4))
-
-                # Close all tabs other than main
-                if chosen_tab["name"] != "All":
-                    new_tabs = [tab for tab in driver.window_handles if tab != main_tab]
-                    for tab in new_tabs:
-                        try:
-                            driver.switch_to.window(tab)
-                            hostname = (
-                                (urlparse(driver.current_url).hostname or "")
-                                .lower()
-                                .rstrip(".")
-                            )
-                            if hostname != "bing.com" and not hostname.endswith(
-                                ".bing.com"
-                            ):
-                                continue
-                            driver.close()
-                        except WebDriverException as e:
-                            short_error = str(e).split("\n")[0][:28]
+                    self._add_to_history(
+                        query, f"[ERROR] {self._search_stage}: {details}"
+                    )
+                    if restriction:
+                        result.restriction = restriction
+                        self._log(f"[RESTRICTED] {restriction}; no recovery attempt")
+                        result.failed += 1
+                        abort = True
+                        break
+                    message = getattr(error, "msg", "") or ""
+                    codes = set(re.findall(r"net::(ERR_[A-Z0-9_]+)", message))
+                    broken_session = isinstance(
+                        error, InvalidSessionIdException
+                    ) or any(
+                        marker in message.lower()
+                        for marker in (
+                            "invalid session id",
+                            "tab crashed",
+                            "disconnected:",
+                            "not connected to devtools",
+                            "chrome not reachable",
+                        )
+                    )
+                    retryable = (
+                        isinstance(error, TimeoutException)
+                        or broken_session
+                        or bool(codes & RETRYABLE_NETWORK_ERRORS)
+                    )
+                    if (
+                        retryable
+                        and result.retries < 2
+                        and not self._stopped(stop_event)
+                    ):
+                        restart = broken_session or result.retries == 1
+                        if restart and (recreate_driver is None or result.restarts):
+                            abort = True
+                        else:
+                            delay = 5 * (result.retries + 1)
                             self._log(
-                                f"[WARNING] WebDriver error when closing tab: {short_error}. Continuing."
+                                f"Recovery {result.retries + 1}/2: waiting {delay}s before retrying search #{index}"
                             )
+                            if self._search_pause(delay, stop_event):
+                                abort = True
+                            else:
+                                try:
+                                    if restart:
+                                        self._log(
+                                            "Recreating the browser session with the existing profile"
+                                        )
+                                        result.restarts += 1
+                                        driver = recreate_driver()
+                                    result.retries += 1
+                                    continue
+                                except AuthenticationRequired as recovery_error:
+                                    result.restriction = str(recovery_error)
+                                    self._log(
+                                        f"[RESTRICTED] Recovery stopped: {recovery_error}"
+                                    )
+                                except Exception as recovery_error:
+                                    self._log(
+                                        f"[ERROR] Session recovery failed: {webdriver_error_details(recovery_error)}"
+                                    )
+                                abort = True
+                    else:
+                        # Do not burn the remaining queries against a persistent
+                        # outage, a blocked request, or an unknown browser error.
+                        abort = True
+                    result.failed += 1
+                    break
+                except Exception as error:
+                    self._log(
+                        f"[ERROR] Search #{index}: {webdriver_error_details(error)}"
+                    )
+                    self._add_to_history(
+                        query, f"[ERROR] {webdriver_error_details(error)}"
+                    )
+                    result.failed += 1
+                    abort = True
+                    break
+                else:
+                    result.successful += 1
+                    self._add_to_history(query, "Success")
+                    break
+            if abort:
+                break
+        self._log(
+            f"{'Mobile' if mobile else 'PC'} search batch: requested={result.requested}, "
+            f"attempted={result.attempted}, successful={result.successful}, failed={result.failed}, "
+            f"skipped={result.requested - result.attempted}, retries={result.retries}, "
+            f"session restarts={result.restarts}. Success means results loaded, not points credited."
+        )
+        return result
 
-                    if main_tab in driver.window_handles:
-                        driver.switch_to.window(main_tab)
+    def _search_pause(self, seconds, stop_event):
+        if stop_event is not None:
+            return stop_event.wait(seconds)
+        time.sleep(seconds)
+        return False
 
-                # Add to history.json
-                self._add_to_history(query, "Success")
-                successful += 1
+    def _check_search_page(self, driver):
+        """Check only the current page; do not log its text or defeat challenges."""
+        state = driver.execute_script("""
+            const nav = performance.getEntriesByType('navigation')[0];
+            return {url: location.href, status: nav ? nav.responseStatus : 0,
+                protocol: nav ? nav.nextHopProtocol : '',
+                error: document.querySelector('#error-code')?.innerText || '',
+                results: !!document.querySelector('#b_results'),
+                challenge: Array.from(document.querySelectorAll(
+                    '#b_captcha, #b_captcha_container, iframe[src*="captcha"]'
+                )).some(e => e.getClientRects().length > 0),
+                text: (document.body ? document.body.innerText : '').slice(0, 2000)};
+        """)
+        page = urlparse(state["url"])
+        status = state.get("status") or 0
+        self._navigation_state = {
+            "url": f"{page.scheme}://{page.netloc}{page.path}",
+            "status": status,
+            "protocol": state.get("protocol", ""),
+            "results": bool(state.get("results")),
+        }
+        if status in (401, 403, 429) or status >= 500:
+            raise SearchRestricted(
+                f"Bing returned HTTP {status}; stop and retry later or inspect manually"
+            )
+        if page.hostname in (
+            "login.live.com",
+            "login.microsoftonline.com",
+            "account.live.com",
+        ):
+            raise SearchRestricted(
+                "Microsoft sign-in or account verification is required"
+            )
+        if (
+            state.get("challenge")
+            or "/turing/" in page.path
+            or (
+                not state.get("results")
+                and re.search(
+                    r"too many requests|unusual traffic|temporarily blocked|request has been blocked|"
+                    r"please\s+(?:solve|complete)\s+the\s+(?:security\s+)?challenge|"
+                    r"verify (?:that )?you(?:'re| are) (?:a human|human|not a robot)|access denied",
+                    state.get("text", ""),
+                    re.I,
+                )
+            )
+        ):
+            raise SearchRestricted(
+                "Bing displayed a security challenge or access restriction; "
+                "resolve it manually in the same browser profile before retrying"
+            )
+        if page.scheme == "chrome-error" or state.get("error"):
+            code = re.search(
+                r"ERR_[A-Z0-9_]+", state.get("error", "") or state.get("text", "")
+            )
+            raise WebDriverException(
+                f"Chrome error page: net::{code.group() if code else 'ERR_FAILED'}"
+            )
+        return (
+            bool(state.get("results"))
+            and page.hostname in ("www.bing.com", "bing.com")
+            and page.path == "/search"
+        )
 
-            except NoSuchElementException:
-                if stop_event is not None and stop_event.is_set():
-                    return successful
-                self._log(f"[ERROR] Search box not found on attempt #{i+1}")
-                self._add_to_history(query, "[ERROR] Search box not found")
-
-            except WebDriverException as e:
-                if stop_event is not None and stop_event.is_set():
-                    return successful
-                short_error = str(e).split("\n")[0][:28]
-                self._log(f"[ERROR] WebDriver error on attempt #{i+1}: {short_error}")
-                self._add_to_history(query, f"[ERROR] WebDriver Error: {short_error}")
-
-            except Exception as e:
-                if stop_event is not None and stop_event.is_set():
-                    return successful
-                self._log(f"[ERROR] Unknown error on attempt #{i+1}: {e}")
-                self._add_to_history(query, f"[ERROR] Unknown Error: {str(e)[:50]}")
-
-        return successful
+    def _search_once(self, driver, query, index, mobile, delays):
+        self._navigation_state = {}
+        self._search_stage = "opening Bing homepage"
+        driver.get("https://www.bing.com")
+        self._check_search_page(driver)
+        time.sleep(random.uniform(*delays))
+        self._search_stage = "finding search box"
+        search_box = driver.find_element(By.NAME, "q")
+        search_box.clear()
+        self._log(f"Search #{index}: {query}")
+        self._search_stage = "submitting query"
+        human_typing(search_box, query)
+        search_box.send_keys(Keys.RETURN)
+        self._search_stage = "waiting for search results"
+        WebDriverWait(driver, 15).until(
+            self._check_search_page, "Bing results were not verified"
+        )
+        # Navigation is now verified. Optional browsing failures must not cause
+        # an already completed query to be resubmitted or counted twice.
+        try:
+            human = HumanBehavior(driver, show_cursor=True, mobile=mobile)
+            time.sleep(random.uniform(2, 4))
+            tabs = [
+                ("All", None),
+                ("Images", "b-scopeListItem-images"),
+                ("Videos", "b-scopeListItem-video"),
+                ("News", "b-scopeListItem-news"),
+            ]
+            name, tab_id = random.choices(tabs, weights=(70, 10, 10, 10), k=1)[0]
+            if tab_id:
+                original = driver.current_window_handle
+                try:
+                    tab = driver.find_element(By.CSS_SELECTOR, f"#{tab_id} a")
+                    human.click_element(tab)
+                    time.sleep(random.uniform(3, 6))
+                    self._check_search_page(driver)
+                    for handle in driver.window_handles:
+                        if handle != original:
+                            driver.switch_to.window(handle)
+                            host = (urlparse(driver.current_url).hostname or "").lower()
+                            if host == "bing.com" or host.endswith(".bing.com"):
+                                driver.close()
+                    driver.switch_to.window(original)
+                except NoSuchElementException:
+                    self._log(f"[WARNING] {name} tab unavailable; keeping web results")
+            else:
+                human.scroll_page()
+            time.sleep(random.uniform(2, 4))
+        except SearchRestricted:
+            raise
+        except WebDriverException as error:
+            self._log(
+                f"[WARNING] Optional result browsing: {webdriver_error_details(error)}"
+            )
 
     def _find_visual_search_element(
         self,
@@ -607,7 +741,7 @@ class SearchEngine:
                 _DROP_IMAGE_JS, payload, os.path.basename(image_path), target
             )
         except WebDriverException as e:
-            short_error = str(e).split("\n")[0][:40]
+            short_error = webdriver_error_details(e)
             self._log(f"[INFO] Drop upload failed ({short_error}).")
             return False
 
@@ -902,12 +1036,7 @@ class SearchEngine:
         if error is None:
             reason = "timed out"
         else:
-            short_error = str(error).split("\n")[0][:80].strip()
-            reason = (
-                f"{type(error).__name__}: {short_error}"
-                if short_error
-                else type(error).__name__
-            )
+            reason = webdriver_error_details(error)
 
         self._log(
             f"[ERROR] Visual search failed while {step} ({reason}). URL: {current_url}"
@@ -1017,7 +1146,7 @@ class SearchEngine:
                 time.sleep(poll_interval)
 
         except WebDriverException as e:
-            short_error = str(e).split("\n")[0][:40]
+            short_error = webdriver_error_details(e)
             self._log(f"[INFO] Could not browse to the image results ({short_error}).")
             return False
 
@@ -1096,7 +1225,7 @@ class SearchEngine:
                 driver.get(mission_url)
                 time.sleep(random.uniform(1, 3))
             except WebDriverException as e:
-                short_error = str(e).split("\n")[0][:28]
+                short_error = webdriver_error_details(e)
                 self._log(
                     f"[INFO] Could not open the mission link ({short_error}). Continuing."
                 )
@@ -1164,7 +1293,7 @@ class SearchEngine:
             try:
                 human.scroll_page()
             except WebDriverException as e:
-                short_error = str(e).split("\n")[0][:28]
+                short_error = webdriver_error_details(e)
                 self._log(
                     f"[WARNING] WebDriver error when scrolling visual search results: {short_error}. Continuing."
                 )

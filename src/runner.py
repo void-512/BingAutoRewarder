@@ -12,6 +12,7 @@ from .config import JSON_FILE_PATH, history_path, stats_path, status_path
 from .dailytasks import DailySet
 from .emulator import DriverManager, HumanBehavior
 from .search import HistoryManager, SearchEngine, llm, resolve_search_locale
+from .search.engine import SearchRestricted, webdriver_error_details
 from .stats import StatsManager, scrape_points_balance
 
 
@@ -39,6 +40,22 @@ class Runner:
         self._session_counts = dict.fromkeys(
             ("pc", "mobile", "cards", "earn", "quests"), 0
         )
+        self._search_summary = {
+            mode: dict.fromkeys(
+                (
+                    "requested",
+                    "attempted",
+                    "successful",
+                    "failed",
+                    "retries",
+                    "restarts",
+                ),
+                0,
+            )
+            for mode in ("pc", "mobile")
+        }
+        self._phase_errors = []
+        self._failed_modes = set()
 
     def run(self, pc, mobile, daily_only=False):
         if self.account.get("deletion_pending"):
@@ -50,19 +67,41 @@ class Runner:
                 f"Initialize this account: ./run.sh --account {self.account['id']} --init"
             )
         schedule = self.account_meta.get_schedule()
+        self._search_summary["pc"]["requested"] = 0 if daily_only else pc
+        self._search_summary["mobile"]["requested"] = 0 if daily_only else mobile
+        complete = False
         try:
             if daily_only or pc + mobile == 0:
-                self._phase(False, 0)
+                self._attempt_phase(False, 0)
             elif schedule.get("advancedScheduling") and schedule.get("enabled"):
                 self._scheduled(pc, mobile, schedule)
             else:
                 if pc:
-                    self._phase(False, pc)
+                    self._attempt_phase(False, pc)
                 if mobile:
-                    self._phase(True, mobile)
+                    self._attempt_phase(True, mobile)
+            if self._stop_event.is_set():
+                self._phase_errors.append("Run stopped before completion")
+            if self._phase_errors:
+                raise RuntimeError("; ".join(self._phase_errors))
             schedule["last_triggered_date"] = date.today().isoformat()
             self.account_meta.set_schedule(schedule)
+            complete = True
+        except Exception as error:
+            if not self._phase_errors or isinstance(error, AuthenticationRequired):
+                self._phase_errors.append(webdriver_error_details(error))
+            raise
         finally:
+            for mode, counts in self._search_summary.items():
+                counts["skipped"] = counts["requested"] - counts["attempted"]
+                self.log(
+                    f"{mode.upper()} final: "
+                    + ", ".join(f"{key}={value}" for key, value in counts.items())
+                )
+            self.log(
+                f"Run {'complete' if complete else 'incomplete'}. "
+                "Search success means verified results, not guaranteed Rewards credit."
+            )
             self.stats.record_session(
                 pc_searches=self._session_counts["pc"],
                 mobile_searches=self._session_counts["mobile"],
@@ -70,7 +109,26 @@ class Runner:
                 earn_cards=self._session_counts["earn"],
                 quest_tasks=self._session_counts["quests"],
                 balance=self._last_scraped_balance,
+                search_summary={
+                    "complete": complete,
+                    "phases": self._search_summary,
+                    "errors": self._phase_errors,
+                },
             )
+
+    def _attempt_phase(self, mobile, count):
+        if mobile in self._failed_modes or self._stop_event.is_set():
+            return
+        try:
+            self._phase(mobile, count)
+        except AuthenticationRequired:
+            # Account challenges and service restrictions apply across modes.
+            raise
+        except Exception as error:
+            detail = f"{'Mobile' if mobile else 'PC'} phase: {webdriver_error_details(error)}"
+            self.log(f"[ERROR] {detail}")
+            self._phase_errors.append(detail)
+            self._failed_modes.add(mobile)
 
     def _scheduled(self, pc, mobile, schedule):
         hours = float(schedule.get("runDuration", 3))
@@ -86,8 +144,10 @@ class Runner:
         ]
         interval = hours * 3600 / max(1, len(batches))
         for index, (is_mobile, count) in enumerate(batches):
-            self._phase(is_mobile, count)
-            if index + 1 < len(batches):
+            if is_mobile in self._failed_modes:
+                continue
+            self._attempt_phase(is_mobile, count)
+            if any(mode not in self._failed_modes for mode, _ in batches[index + 1 :]):
                 delay = max(5, interval * random.uniform(0.75, 1.25))
                 self.log(f"Waiting {delay:.0f}s until the next search batch")
                 time.sleep(delay)
@@ -103,17 +163,23 @@ class Runner:
                 queries = self._build_queries(count)
                 if not queries:
                     raise RuntimeError("No search queries available")
-                done = self.search_engine.perform_searches(
+                result = self.search_engine.perform_searches(
                     self._driver,
                     queries,
                     mobile=mobile,
                     stop_event=self._stop_event,
                     search_delay_range=self.global_settings.get_search_delay(),
+                    recreate_driver=lambda: self._restart_search_driver(mobile),
                 )
-                self._session_counts["mobile" if mobile else "pc"] += int(done or 0)
-                if int(done or 0) < count:
+                mode = "mobile" if mobile else "pc"
+                self._session_counts[mode] += result.successful
+                for key in ("attempted", "successful", "failed", "retries", "restarts"):
+                    self._search_summary[mode][key] += getattr(result, key)
+                if result.restriction:
+                    raise SearchRestricted(result.restriction)
+                if result.successful < count:
                     errors.append(
-                        f"{label} searches incomplete: {int(done or 0)}/{count}"
+                        f"{label} searches incomplete: {result.successful}/{count}"
                     )
             if not mobile:
                 force = self.global_settings.get_force_tasks()
@@ -147,10 +213,18 @@ class Runner:
             if errors:
                 raise RuntimeError("; ".join(errors))
         finally:
-            try:
-                self._driver.quit()
-            finally:
-                self._driver = None
+            self._close_driver()
+
+    def _close_driver(self):
+        if self._driver is not None:
+            self._driver.quit()
+            self._driver = None
+
+    def _restart_search_driver(self, mobile):
+        self._close_driver()
+        self._driver = self.driver_manager.setup_driver(mobile=mobile)
+        require_session(self._driver)
+        return self._driver
 
     def _build_queries(self, count):
         """

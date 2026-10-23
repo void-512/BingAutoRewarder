@@ -165,7 +165,31 @@ Explicit counts and `--daily-only` bypass schedule enable/date guards. A missing
 count uses that account's saved count. Force-task/visual settings are shared
 operational settings; completed cards still use the existing website checks.
 Advanced pacing applies when enabled. A failed partial run retains its statistics
-and is retryable, so a retry may repeat some completed searches.
+and does not set the schedule's completed date. Completed Daily Set activities
+remain saved and are skipped on a later run unless forced.
+
+Recoverable navigation errors get at most two extra attempts per search batch:
+a 5-second pause followed by a retry, then a 10-second pause and one browser
+session recreation using the same profile. Lost sessions go directly to session
+recreation. Persistent errors stop that search mode; mobile searches can still
+run after a desktop failure. Account challenges, CAPTCHA, HTTP access/rate
+restrictions and service errors stop the run without browser recovery attempts.
+Chromium's full `net::ERR_*` code and the failed step appear in the account log,
+with the page path, HTTP status and negotiated protocol, without URL query
+parameters or native stack traces. Bing's HTTP 200 "One last step / Please solve
+the challenge" page is a security restriction even when no CAPTCHA iframe has
+rendered; it stops the run and requires manual resolution in the same browser
+profile. The old truncated `net:` message cannot identify
+the original network cause retroactively.
+
+Final logs and `stats.json` → `last_session.search_summary` distinguish requested,
+attempted, successful, failed and skipped queries, plus extra retry attempts and
+session restarts. Attempted/failed counts refer to distinct queries; retries are
+additional attempts at the same query. Success requires a verified results page
+and does not guarantee Rewards points. Rerunning the original counts may repeat
+successful searches; to retry only missing work, supply explicit remaining
+counts, for example `./run.sh --account Alice --pc 5 --mobile 0` after a run that
+completed 25/30 desktop and 20/20 mobile searches.
 
 Deletion acquires the run/profile locks, verifies Selenium is idle, and removes
 only the selected mounted Chromium profile using a checked container-side path.
@@ -201,30 +225,35 @@ systemctl --user start autorewarder-pi.service
 
 Per-account logs are under `var/accounts/<id>/run.log`, bounded at 6 MiB each.
 Exit codes: 0 success/no schedules due; 1 failure; 2 invalid arguments; 3 human
-reauthentication needed; 75 another operation/session is busy; 130 interrupted.
+attention needed for authentication or a service restriction; 75 another
+operation/session is busy; 130 interrupted.
 No external notification service is configured.
 
 ## Development and validation
 
 ```bash
 ./run.sh --setup
-.venv/bin/python -m pip install -r requirements-dev.txt
 TMPDIR="$HOME/.cache/codex-tmp" TMP="$HOME/.cache/codex-tmp" TEMP="$HOME/.cache/codex-tmp" PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-The offline suite isolates all data in RAM and covers lifecycle decisions,
-confirmation/deletion boundaries and retries, numbered authentication, Remote
-WebDriver/CDP/file upload serialization, scheduling, and CLI-only imports. CI also
-runs formatting, lint, type checks and Compose/shell validation. Live browser checks
-use disposable profiles and never access Microsoft accounts. Successful transport
-or cookie-persistence checks do not establish that Microsoft Rewards will credit
-any particular task; real sign-in and Rewards workflows need account-level validation.
+The offline suite uses the runtime dependencies and Python's standard unittest
+module. It isolates account data in RAM and covers CLI startup/account persistence,
+Authenticator number matching, transient and persistent search failures, session
+recreation, restrictions, profile leases and partial-run recovery.
 
-Validation on 2026-10-23: 34 tests passed in both development and fresh runtime-only
-environments. Fresh/repeated setup, outside-directory invocation, Black, Flake8,
-mypy, both Compose configurations and rendered systemd units passed. Live tests
-with the cached ARM64 Chromium image verified DOM actions, uploads, mobile CDP,
-cookie persistence across browser/container restarts, selected-profile deletion,
-and cleanup after failure/interruption. The original running container was left
-running. Real Microsoft login, Rewards crediting, noVNC interaction and a timer run
-after reboot remain unverified.
+Validation on 2026-10-23: 29 tests passed, including 25/30 desktop searches followed
+by 20/20 mobile searches, and a later five-search retry that retains the completed
+Daily Set. An isolated live ARM64 Chromium check used local fixture pages to verify
+real `net::ERR_CONNECTION_REFUSED` diagnostics, bounded recovery with one session
+recreation, and an HTTP 429 response with zero retries. The disposable profile and
+fixture server were cleaned up. No Microsoft accounts were accessed by these
+checks; real Rewards crediting remains an account-level validation step.
+
+A subsequent authorized real-account run reproduced `ERR_HTTP2_PROTOCOL_ERROR`
+and `ERR_CONNECTION_CLOSED` at desktop search #25. Bounded recovery stopped
+without marking the run complete. A later resume completed the six remaining
+desktop searches, bringing verified desktop work to 30/30. Mobile completed 1/20
+before Bing returned an HTTP 200 security-challenge page. That exposed and fixed
+a missing challenge-text detection case. The existing Daily Set and visual-search
+completion records were retained. Further mobile validation requires manual
+challenge resolution; no security or protocol settings were changed to evade it.
