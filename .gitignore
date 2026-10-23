@@ -28,7 +28,8 @@ dist/
 /var/
 /rewarder_data/
 /chromium_data/
-**/accounts/
+# Root-level account data; src/accounts is application code.
+/accounts/
 **/profiles/
 **/chromium-profiles/
 **/*Profile/
