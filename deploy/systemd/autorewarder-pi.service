@@ -1,0 +1,20 @@
+[Unit]
+Description=Headless Raspberry Pi Rewards
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=1h
+StartLimitBurst=3
+
+[Service]
+Type=exec
+ExecStart="@RUN_SH@"
+UMask=0077
+Restart=on-failure
+RestartSec=10min
+RestartPreventExitStatus=3 75
+RuntimeMaxSec=30h
+TimeoutStopSec=180s
+KillSignal=SIGINT
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal

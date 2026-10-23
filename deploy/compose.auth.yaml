@@ -1,0 +1,9 @@
+# Optional temporary graphical sign-in. The base deployment exposes no VNC.
+services:
+  chromium:
+    ports:
+      - "127.0.0.1:7900:7900"
+    environment:
+      SE_START_VNC: "true"
+      SE_START_NO_VNC: "true"
+      SE_VNC_PASSWORD: ${SE_VNC_PASSWORD:?Set an 8-character temporary VNC password}

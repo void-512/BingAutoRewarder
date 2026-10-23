@@ -1,0 +1,56 @@
+# Python, tooling, virtual environments and build output.
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.tmp
+*.log
+*.backup
+
+# Local configuration, credentials and all runtime/account/browser data.
+.env
+.env.*
+!.env.example
+*.env
+*.pem
+*.key
+*credentials*.json
+*.sqlite*
+*.db
+/var/
+/rewarder_data/
+/chromium_data/
+**/accounts/
+**/profiles/
+**/chromium-profiles/
+**/*Profile/
+**/Cookies*
+**/Local State
+**/Login Data*
+**/Web Data*
+**/settings.json
+**/accounts.json
+**/history.json
+**/status.json
+**/stats.json
+**/locks/
+**/cli.lock
+/background_log.txt
+/logs/
+/downloads/
+
+# Local development metadata and task inputs (never part of a deployment).
+.codegraph/
+.agents/
+.codex/
+.aws/
+.ssh/
+/prompts/

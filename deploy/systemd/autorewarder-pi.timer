@@ -1,0 +1,11 @@
+[Unit]
+Description=Run enabled account schedules daily
+
+[Timer]
+OnCalendar=*-*-* @RUN_TIME@:00
+RandomizedDelaySec=15min
+Persistent=true
+Unit=autorewarder-pi.service
+
+[Install]
+WantedBy=timers.target

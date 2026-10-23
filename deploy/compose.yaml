@@ -1,0 +1,43 @@
+name: ${COMPOSE_PROJECT_NAME:-autorewarder-browser}
+services:
+  chromium:
+    # The pinned linux/arm64 manifest was verified through Docker Hub metadata.
+    image: ${SELENIUM_IMAGE:-selenium/standalone-chromium:4.51.0-20261010@sha256:42ce9ea56fa20549d629fc5ecc65c0bc6e5b1fd2b342e5a0a6d2bab8cee1d440}
+    platform: linux/arm64
+    restart: "no"
+    shm_size: 1gb
+    mem_limit: 3g
+    cpus: 2.0
+    pids_limit: 512
+    stop_grace_period: 2m
+    ports:
+      - "127.0.0.1:${AUTOREWARDER_WEBDRIVER_PORT:-4444}:4444"
+    environment:
+      SE_START_XVFB: "true"
+      SE_START_VNC: "false"
+      SE_START_NO_VNC: "false"
+      SE_NODE_MAX_SESSIONS: "1"
+      SE_NODE_OVERRIDE_MAX_SESSIONS: "false"
+      SE_NODE_SESSION_TIMEOUT: "1800"
+      SE_SESSION_REQUEST_TIMEOUT: "60"
+      SE_SESSION_RETRY_INTERVAL: "2"
+      SE_JAVA_OPTS: "-Xmx512M -XX:+UseG1GC -XX:+UseStringDeduplication"
+      SE_ENABLE_TRACING: "false"
+      SE_SCREEN_WIDTH: "1920"
+      SE_SCREEN_HEIGHT: "1080"
+      TZ: ${TZ:-America/Toronto}
+    volumes:
+      - ${AUTOREWARDER_CHROMIUM_DATA_DIR:?Run ./run.sh --setup}/profiles:${AUTOREWARDER_REMOTE_PROFILE_ROOT:-/home/seluser/profiles}
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    healthcheck:
+      test: ["CMD", "/opt/bin/check-grid.sh", "--host", "0.0.0.0", "--port", "4444"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "2"
